@@ -26,7 +26,7 @@ bc. git clone git://github.com/nhansen/bam2mpg.git
 
 h3. Build bam2mpg:
 
-bc..cd bam2mpg
+bc.. cd bam2mpg
 perl Build.PL
 ./Build
 ./Build test
