@@ -1,0 +1,1049 @@
+#!/usr/bin/perl -w
+
+eval 'exec /usr/bin/perl -w -S $0 ${1+"$@"}'
+    if 0; # not running under some shell
+#########################################################
+# Author:	Nancy Hansen
+# Date:		4/1/2009
+# Function:	MPG "most probable genotype"
+#               Program to predict the most likely genotype
+#               at multiple positions using Bayesian
+#               methods on aligned short read data.
+#               bam2mpg gives mpg results from a BAM
+#               file.
+##########################################################
+
+use strict;
+use Getopt::Long;
+use Carp;
+
+use GTB::Var::SiteProfile;
+use GTB::Var::Polymorphism;
+use GTB::Var::VCF;
+use GTB::File qw(Open);
+use GTB::FASTA;
+use GTB::Unix qw(which);
+
+use vars qw($VERSION);
+
+$| = 1; # let's see output right away!
+
+my $Id = q$Id: bam2mpg 7252 2014-08-22 02:46:47Z nhansen $;
+$VERSION = sprintf "%.4f", substr(q$Rev: 7252 $, 4)/10000;
+
+my $samtools_exe = which("samtools");
+chomp $samtools_exe;
+if (!$samtools_exe) {
+    croak "samtools executable was not found in your PATH\n";
+}
+if (!-x $samtools_exe)
+{
+    croak "Samtools executable $samtools_exe is not executable!\n";
+}
+
+$GTB::FASTA::SAMTOOLS = $samtools_exe;
+
+my $min_ds_coverage = 0; # minimum number of times an allele must be seen on each strand to be included
+my $align_bias = 0; # option to tell program that reference bases are more likely to align than non-ref
+                    # if 55% of bases aligning from a heterozygote are reference, then align bias is .05
+my $qual_filter = 0; # if set to non-zero, will exclude bases with lower than the specified quality
+my $qual_offset = 33; 
+my $opt_pooling; # option to look for non-ref alleles in pools
+my $verbose = 0; # print out a lot!
+my $no_rands = 200; # use a maximum of this many reads' coverage (after quality and strand filtering)
+
+my $prob_error = 0.02;
+my $bam_filter = "-F4"; # skip unmapped reads (unmapped reads are sometimes given the mate position for sorting)
+my $sam_filter = "";    # pipeline command between samtools view/pileup
+my $pileup_filter = "-BQ0";    # pipeline command between samtools view/pileup
+my $min_diff = 3; # this corresponds to the prior probability of observing a non-ref genotype.
+my $indels_only; # option to skip SNP calling and call only indels
+my $no_indels; # option to skip indel calling, saving memory for storing read coordinates.
+my $score_variant; # OLD OPTION--still allowable, but has no effect, as MPV scores are now reported by default.
+my $region = ''; # option to specify only a particular region in the BAM file (in format "1:1000-2000")
+my $only_nonref; # option to report only differences from reference
+my $single_copy; # option to specify a region in the BAM file that is single-copy (e.g., the X or Y chromosome)
+my $nocache; # option to disallow caching of genotypes for unique counts of each base (regardless of quality)
+my $errors; # flag set by option --errors, which will track sequencing errors and their quality
+my $old_indels = 1; # option to run indel detection with old style scoring -- making this option the default for now until we understand just how sensitive the new detection is.
+my ($snv_vcf, $div_vcf, $mpg_out); # optional output files for SNV/DIV VCF, or MPG formatted calls
+my $shorten; # shorten indels rather than reporting the widest unambiguous allele
+my $vcf_spec; # write indels in vcf notation with reference base preceding inserted or deleted bases
+my $sample_name = 'SAMPLE'; # sample name to be written into SAMPLE field of VCF files
+my $seed;
+
+my $Usage = "Usage: bam2mpg <--qual_filter quality> <--snv_vcf 'vcf output file'> <--div_vcf 'vcf output file'> <--mpg 'mpg output file'> <--sample 'sample name for vcf files'> <--only_nonref> <--align_bias bias> <--ds_coverage # of bases required on each strand> <--indels> <--no_indels> <--old_indels> <--nocache> <--errors> <--region chr1:1000-2000> <--single_copy chr:start-end> <--bam_filter 'samtools view options'> <--sam_filter 'unix command'> <--pileup_filter 'mpileup options'> <--use_seed seedvalue> <reference fasta> <bam file>\n";
+
+GetOptions("only_nonref" => \$only_nonref, "snv_vcf=s" => \$snv_vcf, "div_vcf=s" => \$div_vcf, "shorten" => \$shorten, "vcf_spec" => \$vcf_spec, "mpg=s" => \$mpg_out, "sample=s" => \$sample_name, "align_bias=f" => \$align_bias, "ds_coverage=i" => \$min_ds_coverage, "qual_filter=i" => \$qual_filter, "verbose" => \$verbose, "indels" => \$indels_only, "pooling" => \$opt_pooling, "region=s" => \$region, "no_indels" => \$no_indels, "old_indels" => \$old_indels, "score_variant" => \$score_variant, "single_copy=s" => \$single_copy, "use_seed=i" => \$seed ,"errors" => \$errors, "nocache" => \$nocache, "pileup_filter=s" => \$pileup_filter, "bam_filter=s" => \$bam_filter, "sam_filter=s", => \$sam_filter );
+
+($#ARGV == 1)
+  or die "$Usage";
+
+my $ref_fasta = $ARGV[0];
+my $bam_file = $ARGV[1];
+
+my $samtools_verbose = `$samtools_exe 2>&1`;
+$samtools_verbose =~ /Version\: (.*) \(/;
+my $samtools_version = $1;
+
+print "samtools version $samtools_version\n" if $verbose;
+
+my %mpgHash; # for storing previously-calculated MPG results
+my %vcfHash; # for storing previously-calculated SNV vcf results
+
+my $fasta_db = GTB::FASTA->new($ref_fasta);
+my $rh_ref_lengths = {};
+my $rh_indel_error_count = {};
+my $rh_subs_error_count = {};
+my $rh_total_count = {};
+for my $chr ($fasta_db->ids()) {
+    $rh_ref_lengths->{$chr} = $fasta_db->len($chr);
+}
+
+my $rh_sc_regions = parse_single_copy_regions($single_copy, $rh_ref_lengths) if ($single_copy);
+
+print "Assuming uniform error rate of $prob_error and prior log diff of $min_diff.\n";
+print "Filtering bases that are less than quality $qual_filter.\n" if ($qual_filter);
+print "Filtering bases that don\'t have minimum coverage on each strand of $min_ds_coverage.\n" if ($min_ds_coverage);
+print "Assuming an alignment bias of $align_bias.\n" if ($align_bias);
+print "Single-copy regions: $single_copy.\n" if ($single_copy);
+
+# read in coverage in pileup format:
+my $fmt = "-u";
+if ($sam_filter) {
+    $sam_filter .= "| $samtools_exe view -u $ref_fasta - |";
+    $fmt = "";
+}
+my $pileup_command = "mpileup $pileup_filter -A";
+my $pileup_pipe = "$samtools_exe $pileup_command -f $ref_fasta $bam_file |";
+if ($region || $bam_filter || $sam_filter) {
+    $pileup_pipe = "$samtools_exe view $fmt $bam_filter $bam_file $region | "
+        . "$sam_filter $samtools_exe $pileup_command -f $ref_fasta - |";
+}
+
+print "Calling \'$pileup_pipe\'\n" if ($verbose);
+
+open PILEUP, $pileup_pipe
+    or croak "Couldn\'t run $samtools_exe on $bam_file\n";
+
+my $rh_read_pointers = {}; # will contain pointers to align coords of current reads
+my $rh_align_coords = {}; # will contain alignment coordinates for each read (used in indel calling)
+my $rh_indel_coverage = {}; # will hold coverage objects for indels
+
+my $last_ref;
+my $ref_seq;
+if (defined($seed)) {
+    srand($seed);
+}
+
+# open filehandles for file output (also prints header into VCF files):
+
+my ($snv_vcf_obj, $div_vcf_obj, $mpg_fh) = open_output_files($snv_vcf, $div_vcf, $mpg_out);
+
+while (<PILEUP>)
+{
+    if (/^(\S+)\s(\d+)\s([ATGCatgcNn])\s(\d+)\s(\S+)\s(\S+)/)
+    {
+        my ($ref_name, $ref_pos, $ref_base, $no_bases, $cov_string, $qual_string) = ($1, $2, $3, $4, $5, $6);
+        if (!$last_ref || $last_ref ne $ref_name) {
+            $last_ref = $ref_name;
+            $ref_seq = $fasta_db->seq($ref_name);
+        }
+
+        my $sc_here = ($single_copy && exists($rh_sc_regions->{$ref_name}) &&
+                        (($rh_sc_regions->{$ref_name} eq '') ||
+                         (substr($rh_sc_regions->{$ref_name}, $ref_pos-1, 1)
+                             eq '1'))) ? 1 : 0;
+       
+        print "$ref_name\t$ref_pos\t$ref_base\n" if ($verbose);
+        my $uc_ref_base = uc $ref_base;
+
+        my $ra_coverage = []; # will contain bases and qualities seen
+        $rh_indel_coverage->{$ref_name} = {} if (!defined ($rh_indel_coverage->{$ref_name}));
+        $rh_align_coords->{$ref_name} = [] if (!defined ($rh_align_coords->{$ref_name}));
+        $rh_read_pointers->{$ref_name} = [] if (!defined ($rh_read_pointers->{$ref_name}));
+
+        split_coverage($ra_coverage, $rh_read_pointers->{$ref_name}, $rh_align_coords->{$ref_name}, $rh_indel_coverage->{$ref_name}, $cov_string, $qual_string, $ref_pos, \$ref_seq, $qual_offset);
+
+        next if ($indels_only);
+
+        if ($qual_filter) # remove bases with low quality:
+        {
+            filter_for_qual($ra_coverage, $qual_filter);
+        }
+
+        filter_for_ds_coverage($ra_coverage, $min_ds_coverage) if ($min_ds_coverage);
+
+        foreach my $rh_base (@{$ra_coverage})
+        {
+            my $base = $rh_base->{'base'};
+            my $qual = $rh_base->{'qual'};
+
+            print "\t$base\t$qual\n" if ($verbose);
+        }
+
+        if ((!$opt_pooling) && ($no_bases > $no_rands)) {
+            take_random_subset_of_coverage($ra_coverage, $no_rands) unless $opt_pooling;
+        }
+
+        my $ra_cs = [];
+        foreach my $rh_base (@{$ra_coverage})
+        {
+            push @{$ra_cs}, $rh_base->{'base'};
+        }
+        my $cs_string = join("", (sort @{$ra_cs}));
+        if (!$sc_here and !$nocache and exists($mpgHash{$ref_base}{$cs_string}) and !$opt_pooling) {
+            if (!$mpg_fh && !$snv_vcf_obj) { # no output files for SNV's specified--write to STDOUT:
+
+                print "MPG_SNV\t$ref_name\t$ref_pos\t$ref_base";
+                print $mpgHash{$ref_base}{$cs_string};
+                print "\n";
+            }
+            else {
+                if ($mpg_fh) {
+                    print $mpg_fh "MPG_SNV\t$ref_name\t$ref_pos\t$ref_base";
+                    print $mpg_fh $mpgHash{$ref_base}{$cs_string};
+                    print $mpg_fh "\n";
+                }
+                if ($snv_vcf_obj) {
+                    my $vcf_string = $vcfHash{$ref_base}{$cs_string};
+                    my $snv_vcf_fh = $snv_vcf_obj->{file_handle};
+                    if (!$snv_vcf_fh) {
+                        die "No filehandle for writing SNV's to vcf!\n";
+                    }
+                    print $snv_vcf_fh "$ref_name\t$ref_pos";
+                    print $snv_vcf_fh $vcf_string;
+                    print $snv_vcf_fh "\n";
+                }
+            }
+        } else {
+
+            my $site_profile = GTB::Var::SiteProfile->new(
+                              -reference_base => $uc_ref_base,
+                              -coverage => $ra_coverage,
+                              -default_error => $prob_error,
+                              -single_copy => $sc_here);
+
+            my $coverage = @{$ra_coverage};
+            # pooling option:
+            if ($opt_pooling)
+            {
+                foreach my $nr_allele (@{$site_profile->minor_allele_proportion()})
+                {
+                    my $minor_allele = $nr_allele->{'minor_allele'};
+                    my $minor_observed = $nr_allele->{'minor_observed'};
+                    my $total_observed = $nr_allele->{'total_observed'};
+                    my $minor_forward = $nr_allele->{'minor_forward'};
+                    my $total_forward = $nr_allele->{'total_forward'};
+                    my $minor_reverse = $nr_allele->{'minor_reverse'};
+                    my $total_reverse = $nr_allele->{'total_reverse'};
+                    my $proportion = $nr_allele->{'proportion'};
+                    my $error = $nr_allele->{'error'};
+                    print "MAP\t$ref_name\t$ref_pos\t$ref_base\t$minor_allele\t$minor_observed/$total_observed\t$minor_forward/$total_forward\t$minor_reverse/$total_reverse\t$proportion\t$error\n";
+                }
+                next;
+            }
+    
+            my $rh_log_likelihoods = $site_profile->log_likelihoods(
+                                -prior_diff => $min_diff,
+                                -alignment_bias => $align_bias);
+    
+            my @sorted_genotypes = sort {$rh_log_likelihoods->{$b} <=>
+                                    $rh_log_likelihoods->{$a}} 
+                                         keys %{$rh_log_likelihoods};
+    
+            my $mpg = $sorted_genotypes[0]; # most probable genotype
+            # compare to homozygous ref for MPV score, and to next most probable genotype for MPG score
+            my $nmpg = $sorted_genotypes[1]; # next most probable genotype
+            my $rg = ($sc_here) ? $uc_ref_base : "$uc_ref_base$uc_ref_base"; # reference genotype
+            if (!(defined($rh_log_likelihoods->{$rg}))) { # e.g., when reference base is an "N"
+                if ($verbose) {
+                    print STDERR "No ll for reference genotype $rg at $ref_name:$ref_pos (ref base $ref_base, mpg $mpg)--using next most likely genotype!\n";
+                }
+                $rg = $nmpg;
+            }
+            my $mpg_score = int($rh_log_likelihoods->{$mpg} - $rh_log_likelihoods->{$nmpg});
+            my $mpv_score = int($rh_log_likelihoods->{$mpg} - $rh_log_likelihoods->{$rg});
+    
+            my $nr = (($sc_here && $mpg eq $uc_ref_base) || 
+                             ($mpg eq "$uc_ref_base$uc_ref_base")) ? 0 : 1;
+            next if ($nr == 0 and $only_nonref);
+            $mpgHash{$ref_base}{$cs_string} = "\t$mpg\t$mpg_score\t$nr\t$coverage\t$mpv_score" unless ($sc_here || $nocache);
+            if (!$mpg_fh && !$snv_vcf_obj) { # no output files for SNV's specified--write to STDOUT:
+
+                print "MPG_SNV\t$ref_name\t$ref_pos\t$ref_base\t$mpg\t$mpg_score\t$nr\t$coverage\t$mpv_score";
+                print "\n";
+            }
+            else {
+                if ($mpg_fh) {
+                    print $mpg_fh "MPG_SNV\t$ref_name\t$ref_pos\t$ref_base\t$mpg\t$mpg_score\t$nr\t$coverage\t$mpv_score";
+                    print $mpg_fh "\n";
+                }
+                if ($snv_vcf_obj) {
+                    my $vcf_line = $snv_vcf_obj->vcf_line( '-chrom' => $ref_name, 
+                                                           '-pos' => $ref_pos, 
+                                                           '-ref_allele' => $ref_base, 
+                                                           '-genotype' => $mpg, 
+                                                           '-genotype_score' => $mpg_score, 
+                                                           '-variant_score' => $mpv_score, 
+                                                           '-coverage' => $ra_coverage, 
+                                                           '-type' => 'SNV'); 
+
+                    my $vcf_tailstring = $vcf_line;
+                    chomp $vcf_tailstring; # remove end of line
+                    $vcf_tailstring =~ s/^(\S+)\t(\S+)//; # removing chromosome, position fields
+                    $vcfHash{$ref_base}{$cs_string} = $vcf_tailstring;
+                }
+            }
+            if (($errors) && ($nr == 0)  && ($coverage < 2*$mpg_score)) {
+                foreach my $rh_covg (@{$ra_coverage}) {
+                    my $qual = $rh_covg->{'qual'};
+                    if (uc($rh_covg->{'base'}) ne $uc_ref_base) {
+                        $rh_subs_error_count->{$qual}++;
+                    }
+                    $rh_total_count->{$qual}++;
+                }
+            }
+        }
+    }
+}
+
+close PILEUP;
+
+exit if ($opt_pooling);
+
+unless ($no_indels)
+{
+    foreach my $ref (keys %{$rh_align_coords})
+    {
+        my $ref_seq = $fasta_db->seq($ref);
+        process_indels($ref, $rh_indel_coverage->{$ref}, $rh_align_coords->{$ref}, \$ref_seq, $rh_indel_error_count);
+        print_error_tables($ref, $rh_subs_error_count, $rh_indel_error_count, $rh_total_count) if ($errors);
+    }
+}
+
+sub open_output_files {
+    my $snv_vcf = shift;
+    my $div_vcf = shift;
+    my $mpg_out = shift;
+
+    my ($snv_vcf_obj, $div_vcf_obj, $mpg_fh);
+
+    if ($mpg_out) {
+        $mpg_fh = Open($mpg_out, "w"); # will use gzip for ".gz" extension
+    }
+
+    GTB::File::use_bgzip(); # use bgzip for zipping VCF's, if available
+    if ($snv_vcf) {
+        my $snv_vcf_fh = Open($snv_vcf, "w");
+        $snv_vcf_obj = GTB::Var::VCF->new(-sample_name => $sample_name,
+                                          -program => 'bam2mpg',
+                                          -fasta_db => $fasta_db,
+                                          -shorten => $shorten,
+                                          -spec => $vcf_spec,
+                                          -file_handle => $snv_vcf_fh);
+
+        $snv_vcf_obj->vcf_header();
+    }
+    if ($div_vcf && (!($snv_vcf) || $div_vcf ne $snv_vcf)) {
+        my $div_vcf_fh = Open($div_vcf, "w");
+        $div_vcf_obj = GTB::Var::VCF->new(-sample_name => $sample_name,
+                                          -program => 'bam2mpg',
+                                          -fasta_db => $fasta_db,
+                                          -shorten => $shorten,
+                                          -spec => $vcf_spec,
+                                          -file_handle => $div_vcf_fh);
+
+        $div_vcf_obj->vcf_header();
+    }
+    elsif ($div_vcf) {
+        $div_vcf_obj = $snv_vcf_obj;
+    }
+
+    return ($snv_vcf_obj, $div_vcf_obj, $mpg_fh);
+}
+
+sub split_coverage
+{
+    my $ra_coverage = shift;
+    my $ra_ref_read_pointers = shift;
+    my $ra_align_coords = shift;
+    my $rh_indel_coverage = shift;
+    my $cov_string = shift;
+    my $qual_string = shift;
+    my $ref_pos = shift;
+    my $ref_seq = shift;
+    my $qual_offset = shift;
+
+    my $ref_base = substr($$ref_seq, $ref_pos - 1, 1);
+    my $ref_end = length $$ref_seq;
+
+    my $rev_cov = reverse $cov_string;
+    my $rev_qual = reverse $qual_string;
+
+    my $read_no = 0;
+    my $del_no = 0; # count number of deleted bases seen
+    my $qual = 0;
+    while (my $base = chop $rev_cov)
+    {
+        if ($base =~ /[.,ATGCNatgcn*]/) # just a normal base
+        {
+            if ($base ne '*')
+            {
+                $qual = chop $rev_qual;
+                $qual = ord($qual) - $qual_offset; # convert quality char to score
+                $base = uc $ref_base if ($base eq '.'); # reference base (forward)
+                $base = lc $ref_base if ($base eq ','); # reference base (reverse)
+   
+                if ($verbose) {
+                    print "Pushing $base, quality $qual\n";
+                }
+                if (!(defined ($qual))) {
+                    die "Undefined quality score!\n";
+                }
+                push @{$ra_coverage}, {'base' => $base, 'qual' => $qual};
+            }
+            else { # pads have qualities!
+                chop $rev_qual;
+            }
+
+            $read_no++; # record what read number we're on (even if it's a pad)
+        }
+        elsif (($base eq '^') && (!$no_indels)) # beginning of new alignment
+        {
+            my $align_score = chop $rev_cov;
+            $align_score = ord($align_score) - 33; # samtools uses offset 33
+
+            push @{$ra_align_coords}, {'start' => $ref_pos, 'score' => $align_score};
+            $ra_ref_read_pointers->[$read_no + 1] = $ra_align_coords->[$#{$ra_align_coords}];
+        }
+        elsif (($base eq '$') && (!$no_indels)) # end of read
+        {
+            $ra_ref_read_pointers->[$read_no]->{'end'} = $ref_pos;
+            my $this_read_start = $ra_ref_read_pointers->[$read_no]->{'start'};
+            my $this_read_score = $ra_ref_read_pointers->[$read_no]->{'score'};
+            #print "From $this_read_start-$ref_pos, score $this_read_score\n";
+             
+            splice(@{$ra_ref_read_pointers}, $read_no, 1); # remove this read from current list
+            $read_no--;
+        }
+        elsif ($base eq '+') # insertion wrt reference
+        {
+            my $no_bases = 0;
+            my $digit = chop $rev_cov;
+            while ($digit =~ /\d/)
+            {
+                $no_bases *= 10;
+                $no_bases += $digit;
+                $digit = chop $rev_cov;
+            }
+            my $inserted_bases = $digit;
+            my $this_base_no = 1;
+            while ($this_base_no < $no_bases)
+            {
+                $inserted_bases .= chop $rev_cov;
+                $this_base_no++;
+            }
+
+            my $strand = ($inserted_bases =~ /[atgc]/) ? 'C' : 'U';
+
+            $inserted_bases = uc $inserted_bases;
+
+            my $flank_bases_to_include = 1000;
+            my $left_flank_end = $ref_pos;
+            my $right_flank_start = $ref_pos + 1;
+
+            my $lf_offset = ($left_flank_end - $flank_bases_to_include >= 0) ? $left_flank_end - $flank_bases_to_include : 0;
+            my $lf_include = $left_flank_end - $lf_offset;
+            my $rf_include = ($ref_end - $right_flank_start + 1 < $flank_bases_to_include) ? $ref_end - $right_flank_start + 1 : $flank_bases_to_include;
+            my $left_flank_seq = substr($$ref_seq, $lf_offset, $lf_include);
+            my $right_flank_seq = substr($$ref_seq, $right_flank_start - 1, $rf_include);
+
+            $left_flank_seq = uc $left_flank_seq;
+            $right_flank_seq = uc $right_flank_seq;
+
+            my $ref_allele = '';
+
+            my $new_allele = $inserted_bases;
+            my $poly = GTB::Var::Polymorphism->new(
+                                 -left_flank_end => $left_flank_end,
+                                 -right_flank_start => $right_flank_start,
+                                 -left_flank_seq => $left_flank_seq,
+                                 -right_flank_seq => $right_flank_seq,
+                                 -type => 'Insertion',
+                                 -allele_seqs => [$ref_allele, $new_allele] );
+
+            print "Original: $left_flank_end-$right_flank_start ($ref_allele/$new_allele) ($left_flank_seq/$right_flank_seq)\n" if ($verbose);
+
+            my $new_left_flank_end = $poly->left_flank_end();
+            my $new_right_flank_start = $poly->right_flank_start();
+            my $new_ra_alleles = $poly->allele_seqs();
+            $new_allele = $new_ra_alleles->[1];
+            print "Adjusted: $new_left_flank_end-$new_right_flank_start\n" if ($verbose);
+            if (!defined ($new_right_flank_start))
+            {
+                croak "Indel expanded has no right flank start!\n";
+            }
+            push @{$rh_indel_coverage->{$new_left_flank_end}->
+                        {$new_right_flank_start}}, {
+                                  'allele' => $new_allele,
+                                  'qual' => $qual,
+                                  'type' => 'Insertion',
+                                  'strand' => $strand};
+            print "Pushing Insertion at $new_left_flank_end:$new_right_flank_start\n" if ($verbose);
+
+        }
+        elsif ($base eq '-') # deletion wrt reference
+        {
+            my $no_bases = 0;
+            my $digit = chop $rev_cov;
+            while ($digit =~ /\d/)
+            {
+                $no_bases *= 10;
+                $no_bases += $digit;
+                $digit = chop $rev_cov;
+            }
+            my $deleted_bases = $digit;
+            my $this_base_no = 1;
+            while ($this_base_no < $no_bases)
+            {
+                $deleted_bases .= chop $rev_cov;
+                $this_base_no++;
+            }
+
+            my $strand = ($deleted_bases =~ /atgc/) ? 'C' : 'U';
+            $deleted_bases = uc $deleted_bases;
+            my $del_size = length $deleted_bases;
+            my $left_flank_end = $ref_pos;
+            my $right_flank_start = $ref_pos + $del_size + 1;
+
+            my $flank_bases_to_include = 1000;
+
+            my $lf_offset = ($left_flank_end - $flank_bases_to_include >= 0) ? $left_flank_end - $flank_bases_to_include : 0;
+            my $lf_include = $left_flank_end - $lf_offset;
+            my $rf_include = ($ref_end - $right_flank_start + 1 < $flank_bases_to_include) ? $ref_end - $right_flank_start + 1 : $flank_bases_to_include;
+            my $left_flank_seq = substr($$ref_seq, $lf_offset, $lf_include);
+            my $right_flank_seq = substr($$ref_seq, $right_flank_start - 1, $rf_include);
+
+            $left_flank_seq = uc $left_flank_seq;
+            $right_flank_seq = uc $right_flank_seq;
+
+            my $ref_allele = $deleted_bases;
+
+            print "Deleted bases: $ref_allele\n" if ($verbose);
+
+            my $new_allele = '';
+            my $poly = GTB::Var::Polymorphism->new(
+                                 -left_flank_end => $left_flank_end,
+                                 -right_flank_start => $right_flank_start,
+                                 -left_flank_seq => $left_flank_seq,
+                                 -right_flank_seq => $right_flank_seq,
+                                 -type => 'Deletion',
+                                 -allele_seqs => [$ref_allele, $new_allele] );
+
+            print "Original: $left_flank_end-$right_flank_start ($ref_allele/$new_allele) ($left_flank_seq/$right_flank_seq)\n" if ($verbose);
+
+            my $new_left_flank_end = $poly->left_flank_end();
+            my $new_right_flank_start = $poly->right_flank_start();
+            my $new_ra_alleles = $poly->allele_seqs();
+            $new_allele = $new_ra_alleles->[1];
+            print "Adjusted: $new_left_flank_end-$new_right_flank_start\n" if ($verbose);
+            push @{$rh_indel_coverage->{$new_left_flank_end}->
+                            {$new_right_flank_start}}, {
+                                  'allele' => $new_allele,
+                                  'qual' => $qual,
+                                  'type' => 'Deletion',
+                                  'strand' => $strand};
+            print "Pushing Deletion at $new_left_flank_end:$new_right_flank_start\n" if ($verbose);
+        }
+    }
+}
+
+sub parse_single_copy_regions
+{
+    my $sc_string = shift;
+    my $rh_ref_lengths = shift;
+    my $rh_single_copy = {};
+
+    my @sc_regions = split /,/, $sc_string;
+
+    foreach my $region (@sc_regions) {
+        if ($region !~ /:/) {
+            $rh_single_copy->{$region} = '';
+        }
+        elsif ($region =~ /^([^:]+):(\d+)\-(\d+)$/) {
+            my $ref = $1;
+            my ($start, $end) = ($2, $3);
+            my $length = $end - $start + 1;
+            if ($rh_single_copy->{$ref}) {
+                my $one_string = make_long_string('1', $length);
+                substr($rh_single_copy->{$ref}, $start - 1, $length, $one_string);
+            }
+            else {
+                my $ref_length = $rh_ref_lengths->{$ref};
+                $rh_single_copy->{$ref} = make_long_string('2', $ref_length);
+                my $one_string = make_long_string('1', $length);
+                my $offset = $start - 1;
+                print "Reference length $ref_length, start at $start - 1, length $length\n";
+                substr($rh_single_copy->{$ref}, $offset, $length, $one_string);
+            }
+        }
+    }
+
+    return $rh_single_copy;
+}
+
+sub make_long_string {
+    my $char = shift;
+    my $desired_length = shift;
+
+    my $power_of_2 = int(log($desired_length)/log(2));
+    my $remainder = $desired_length - 2**$power_of_2;
+
+    my $long_string = $char;
+    for (my $i=1; $i<=$power_of_2; $i++) {
+        $long_string = $long_string.$long_string;
+    }
+
+    for (my $j=0; $j<$remainder; $j++) {
+        $long_string .= $char;
+    }
+
+    return $long_string;
+}
+
+sub filter_for_qual
+{
+    my $ra_coverage = shift;
+    my $min_qual = shift;
+
+    my @new_coverage = ();
+    foreach my $rh_base (@{$ra_coverage})
+    {
+        if ($rh_base->{'qual'} >= $min_qual)
+        {
+            push @new_coverage, $rh_base;
+        }
+    }
+
+    @{$ra_coverage} = @new_coverage;
+}
+
+sub filter_for_ds_coverage
+{
+    my $ra_coverage = shift;
+    my $min_ds_coverage = shift;
+
+    my @new_coverage = ();
+
+    foreach my $for_base qw(A T G C)
+    {
+        my $rev_base = lc $for_base;
+        my @for_bases = grep {$_->{'base'} eq $for_base} @{$ra_coverage};
+        my $no_for = @for_bases;
+        my @rev_bases = grep {$_->{'base'} eq $rev_base} @{$ra_coverage};
+        my $no_rev = @rev_bases;
+        next if ($no_for < $min_ds_coverage || $no_rev < $min_ds_coverage);
+        push @new_coverage, @for_bases;
+        push @new_coverage, @rev_bases;
+    }
+
+    @{$ra_coverage} = @new_coverage;
+}
+
+sub take_random_subset_of_coverage
+{
+    my $ra_coverage = shift;
+    my $no_rands = shift;
+
+    my @set = @{$ra_coverage}; # make a copy
+
+    if (defined($seed)) {
+        @set = sort {$a->{base} cmp $b->{base} || $a->{qual} <=> $b->{qual}} @{$ra_coverage};
+    }
+
+    my $k = @set;
+    return if ($k <= $no_rands);
+
+    @{$ra_coverage} = ();
+    while (--$no_rands >= 0) {
+        my $r = int(rand($k));
+        push @{$ra_coverage}, $set[$r];
+        $set[$r] = $set[--$k];
+    }
+
+}
+
+sub process_indels
+{
+    my $ref_name = shift;
+    my $rh_indel_coverage = shift; # indel coverage arrays by position
+    my $ra_align_coords = shift;
+    my $ref_seq = shift;
+    my $rh_indel_error_count = shift;
+
+    print "Processing indels\n" if ($verbose);
+
+    my $min_ac_index = 0; # this will be pushed up as we progress through the reference
+    my $ra_max_end = []; # record maximum read end seen up to each index
+    foreach my $left_flank_end (sort {$a <=> $b} keys %{$rh_indel_coverage})
+    {
+        my $sc_here = ($single_copy && exists($rh_sc_regions->{$ref_name}) &&
+                        (($rh_sc_regions->{$ref_name} eq '') ||
+                         (substr($rh_sc_regions->{$ref_name}, $left_flank_end-1, 1)
+                             eq '1'))) ? 1 : 0;
+       
+        foreach my $right_flank_start (sort {$a <=> $b} keys %{$rh_indel_coverage->{$left_flank_end}})
+        {
+            print "Indel has flanks $left_flank_end:$right_flank_start\n" if ($verbose);
+            my $orig_ref_allele = substr($$ref_seq, $left_flank_end, 
+                         $right_flank_start - $left_flank_end - 1);
+            my $ref_allele = uc $orig_ref_allele;
+            $ref_allele = '*' if (!$ref_allele);
+
+            my %all_alleles = ();
+   
+            my $ra_coverage = [];
+
+            my $reads_seen = 0; # count so that we know all remaining aligned must be reference
+            foreach my $rh_cov (@{$rh_indel_coverage->{$left_flank_end}->{$right_flank_start}})
+            {
+                $reads_seen++;
+                my $allele = $rh_cov->{'allele'} || '*';
+                my $indel_length = length($orig_ref_allele) - 
+                                    length($rh_cov->{'allele'});
+                my $abs_indel_length = ($indel_length > 0) ? $indel_length : -$indel_length;
+                my $qual = ($old_indels) ? $rh_cov->{'qual'} : $rh_cov->{'qual'} + 10*$abs_indel_length;
+                next if (($qual_filter) && ($qual < $qual_filter));
+                my $strand = $rh_cov->{'strand'};
+                $all_alleles{$allele} = 1;
+
+                $allele = lc $allele if ($strand eq 'C');
+
+                my $error_prob = ($old_indels) ? undef : 10**(-$qual/10);
+                push @{$ra_coverage}, {'base' => $allele,
+                                       'qual' => $qual,
+                                       'error_prob' => $error_prob };
+                print "Pushing allele $allele with quality $qual\n" if ($verbose);
+            }
+
+            my @other_alleles = keys %all_alleles;
+            next if (!@other_alleles); # all filtered out for quality
+
+            # count number of reads that stretch across this putative indel's flanking ends: 
+            my $no_reads = 0;
+            for (my $ac_index = $min_ac_index; $ra_align_coords->[$ac_index] &&
+                   $ra_align_coords->[$ac_index]->{'start'} <= $left_flank_end;
+                   $ac_index++)
+            {
+                my $ac_end = $ra_align_coords->[$ac_index]->{'end'};
+                $no_reads++ if ($ac_end >= $right_flank_start);
+                if (!defined ($ra_max_end->[$ac_index]))
+                {
+                    $ra_max_end->[$ac_index] = ($ac_index == 0) ? $ac_end :
+                                               ($ra_max_end->[$ac_index-1] > $ac_end) ? $ra_max_end->[$ac_index-1] : $ac_end;
+                }
+                # move min_ac_index up if we can
+                if ($ra_max_end->[$ac_index] < $left_flank_end)
+                {
+                    $min_ac_index = $ac_index;
+                }
+            }
+
+            my $no_ref_alleles = $no_reads - $reads_seen;
+            print "Adding $no_ref_alleles reference alleles\n" if ($verbose);
+
+            for (my $i=0; $i<$no_ref_alleles; $i++)
+            {
+                push @{$ra_coverage}, {'base' => $ref_allele, 'qual' => $qual_filter};
+            }
+
+            take_random_subset_of_coverage($ra_coverage, $no_rands);
+
+            my $ra_all_alleles = [$ref_allele];
+            push @{$ra_all_alleles}, keys %all_alleles;
+
+            my $site_profile = GTB::Var::SiteProfile->new(
+                                  -reference_base => $ref_allele,
+                                  -coverage => $ra_coverage,
+                                  -default_error => $prob_error,
+                                  -allele_seqs => $ra_all_alleles,
+                                  -single_copy => $sc_here,
+                                  -verbose => $verbose);
+
+            my $rh_log_likelihoods = $site_profile->log_likelihoods(
+                                -prior_diff => $min_diff,
+                                -alignment_bias => $align_bias);
+    
+            my @sorted_genotypes = sort {$rh_log_likelihoods->{$b} <=>
+                                    $rh_log_likelihoods->{$a}} 
+                                         keys %{$rh_log_likelihoods};
+   
+            my $mpg = $sorted_genotypes[0]; # most probable genotype
+            # compare to homozygous ref for MPV score, and to next most probable genotype for MPG score
+            my $nmpg = $sorted_genotypes[1]; # next most probable genotype
+            my $rg = ($sc_here) ? $ref_allele : "$ref_allele:$ref_allele"; # ref genotype
+            my $mpg_score = int($rh_log_likelihoods->{$mpg} - $rh_log_likelihoods->{$nmpg});
+            my $mpv_score = int($rh_log_likelihoods->{$mpg} - $rh_log_likelihoods->{$rg});
+            print "Most prob $mpg, next most prob $nmpg (score $mpg_score)\n" if ($verbose);
+
+            $mpg = '*'.$mpg if ($mpg =~ /^:/);
+            $mpg = $mpg.'*' if ($mpg =~ /:$/);
+
+            my $coverage = scalar(@{$ra_coverage});
+            $ref_allele = uc $ref_allele || '*';
+            my $nr = ($single_copy && $mpg eq $ref_allele) || 
+                       ($mpg eq "$ref_allele:$ref_allele") ? 0 : 1;
+
+            next if ($nr == 0 and $only_nonref);
+            
+            if (!$mpg_fh && !$div_vcf_obj) { # no output files for DIV's specified--write to STDOUT:
+                print "MPG_DIV\t$ref_name\t$left_flank_end:$right_flank_start\t$ref_allele\t$mpg\t$mpg_score\t$nr\t$coverage\t$mpv_score\n";
+            }
+            else {
+                if ($mpg_fh) {
+                    print $mpg_fh "MPG_DIV\t$ref_name\t$left_flank_end:$right_flank_start\t$ref_allele\t$mpg\t$mpg_score\t$nr\t$coverage\t$mpv_score\n";
+                }
+                if ($div_vcf_obj) {
+                    my $vcf_line = $div_vcf_obj->vcf_line( '-chrom' => $ref_name, 
+                                                           '-pos' => "$left_flank_end:$right_flank_start",
+                                                           '-ref_allele' => $ref_allele, 
+                                                           '-genotype' => $mpg, 
+                                                           '-genotype_score' => $mpg_score, 
+                                                           '-variant_score' => $mpv_score, 
+                                                           '-coverage' => $ra_coverage, 
+                                                           '-type' => 'DIV'); 
+
+                }
+            }
+
+            if (($errors) && ($nr == 0)) { # for now, consider all indels that aren't part of a non-ref call && ($mpg_score >= 10) && ($mpg_score >= 0.5*$coverage)) {
+                foreach my $rh_covg (@{$ra_coverage}) {
+                    my $allele = $rh_covg->{'base'};
+                    $allele = '' if ($allele eq '*');
+                    my $qual = $rh_covg->{'qual'};
+                    my $indel_length = length($orig_ref_allele) - 
+                                        length($allele);
+                    $rh_indel_error_count->{$indel_length}->{$qual}++ 
+                                        if ($indel_length);
+                }
+            }
+        }
+    }
+}
+
+sub print_error_tables {
+    my $ref_name = shift;
+    my $rh_subs_error_count = shift;
+    my $rh_indel_error_count = shift;
+    my $rh_total_count = shift;
+
+    open SUBS, ">$ref_name.substitution_errors.txt"
+        or die "Couldn\'t open $ref_name.substitution_errors.txt for writing: $!\n";
+
+    open INDELS, ">$ref_name.indel_errors.txt"
+        or die "Couldn\'t open $ref_name.indel_errors.txt for writing: $!\n";
+
+    my $log_10 = log(10.0);
+    foreach my $qual (sort {$a <=> $b} keys %{$rh_total_count}) {
+        my $total_bases = $rh_total_count->{$qual};
+        my $substitutions = $rh_subs_error_count->{$qual} || 0;
+        my $subs_rate = sprintf("%5.4f", $substitutions/$total_bases);
+        my $subs_empirical_q = ($substitutions) ? int(-10.0*log($substitutions/$total_bases)/$log_10) : 'NA';
+        print SUBS "$qual\t$substitutions\t$total_bases\t$subs_rate\t$subs_empirical_q\n";
+
+        foreach my $length (sort {$a <=> $b} keys %{$rh_indel_error_count}) { 
+            my $indels = $rh_indel_error_count->{$length}->{$qual} || 0;
+            my $indel_rate = sprintf("%5.4f", $indels/$total_bases);
+            my $indel_empirical_q = ($indels) ? int(-10.0*log($indels/$total_bases)/$log_10) : 'NA';
+            print INDELS "$qual\t$length\t$indels\t$total_bases\t$indel_rate\t$indel_empirical_q\n";
+        }
+    }
+    
+    close SUBS;
+    close INDELS;
+
+}
+
+=pod
+
+=head1 NAME
+
+B<bam2mpg> - Most probable genotype program for predicting variants and genotypes from alignments of short reads in BAM format.
+
+=head1 SYNOPSIS
+
+B<bam2mpg> I<ref.fasta> I<aln.sorted.bam>
+
+=head1 DESCRIPTION
+
+This script uses samtools to process a BAM formatted file (http://samtools.sourceforge.net) and call genotypes and confidence scores across a covered region.
+
+For a set of aligned allele observations, the MPG ("Most Probable Genotype") algorithm is used to calculate the posterior probability of every possible diploid genotype (or single-allele genotypes for regions specified with the --single_copy option, e.g., on the non-PAR regions of the X and Y chromosome in a male).  The statistical model uses base quality scores to calculate the probability of base-calling errors, and assumes a single prior probability for any non-homozygous-reference genotype.
+
+=head1 MPG INPUT
+
+The first argument to bam2mpg is the path of a fasta-formatted file for the reference sequence.  This fasta file must have a corresponding samtools index file with the same name except for an appended ".fai".
+
+The second argument to bam2mpg is the path of a BAM-formatted file of aligned sequencing reads.  This file must be sorted and indexed using samtools prior to running bam2mpg.
+
+=head1 MPG OUTPUT
+
+If no vcf file is specified (either by --snv_vcf or --div_vcf options, see below), and no mpg file is specified (using the --mpg option, see below), the standard output of the program will contain "MPG" lines with nine tab-separated fields.  These fields are:
+
+=over 5
+
+=item B<variant type>
+
+The variant type can be "MPG_SNV", which indicates a single base change at the position specified by the second and third fields, or "MPG_DIV" which indicates a deletion or insertion occurring between the "flanking" positions separated by a colon in the third field.
+
+=item B<chromosome>
+
+This is the name of the entry in the fasta reference sequence passed as the first argument (and of the matching reference entry in the BAM file).
+
+=item B<position>
+
+For an SNV, the position reported is the actual position of the nucleotide change.  For DIV's, this field contains a colon-separated pair of positions, which represent the flanking positions surrounding the largest variable region in the sequence.  So, for example, in a variable-length run of T's, the flanking positions would be the positions of the non-T characters outside of the run, and the alleles reported in the fourth and fifth fields would be the T's between these flanking positions.
+
+=item B<reference allele>
+
+This is the base or bases seen in the reference sequence either at the specified position (for an SNV) or between the reported flanking positions (for a DIV).  When the flanking positions are adjacent, so there are no bases between them, a "*" is reported to enable splitting on white space rather than tabs.
+
+=item B<genotype>
+
+The genotype reported is the genotype with the highest posterior probability according to Bayes theorem, given the observed reads and quality scores, according to the program's error model.  For SNV's, the two alleles are concatenated, so, for example "AT" indicates one A and one T.  For DIV's, the two alleles are separated by a colon, with a "*" indicating an allele of zero bases.
+
+When the --single_copy option is used, single allele genotypes are reported, so no colon-separation is used in the DIV.  This lack of a colon in MPG_DIV genotypes, as well as a single-character genotype at MPG_SNV positions, is what distinguishes "single_copy" output.
+
+=item B<MPG score>
+
+The MPG score field contains the difference between the natural logarithms of the most probable and second most probable genotype's probabilities, and is therefore an indicator of the probability the reported genotype is correct.  So, for example, a score of 10 would imply that the reported genotype was approximately 22,000 times as probable as the next most probable genotype.  Since bam2mpg will call genotypes at any base position, variant or not, we recommend using a score cutoff of 10 to avoid a high level of false positive predictions of variation.
+
+=item B<ref/non-ref field>
+
+This field is 0 for a homozygous-reference genotype, and 1 for anything else, allowing easy extraction of non-reference genotype lines with "awk".
+
+=item B<coverage>
+
+This field reports the number of reads used to calculate the most probable genotype.  It does not include bases that have been filtered for quality (with --qual_filter) or reads beyond the 200 maximum reads the program allows.
+
+=item B<MPV score>
+
+The MPV score reports the difference between the natural logarithms of the most probable and the homozygous reference genotype, and is therefore an indicator of the probability that the position's true genotype is something other than homozygous reference (although not a phred-scaled indicator).
+
+=back
+
+=head1 MPG OPTIONS
+
+=over 5
+
+=item B<--region> I<chr>
+
+=item B<--region> I<chr:start-end>
+
+This option specifies a region as a reference entry optionally followed by a position range, and causes variants to be called only in that region.
+
+=item B<--qual_filter> I<minimum_quality>
+
+This option specifies a minimum base quality score necessary for a base to be included in the calculation for a particular aligned position.  Bases with quality scores below this value will be completely ignored.  At GTB, bam2mpg is almost always run with --qual_filter 20. (Default: 0)
+
+=item B<--single_copy> I<chr1:start1-end1,chr2:start2-end2>
+
+This option specifies regions for which only a single copy exists in the genome, so that only one allele is expected to be seen.  The regions should be comma-separated without spaces, and in the same format as expected by the --region option.
+
+=item B<--indels>
+
+This flag option causes the script to skip SNV predictions and only report DIV variants.
+
+=item B<--no_indels>
+
+This flag option causes the script to skip DIV predictions and only report SNV variants.
+
+=item B<--old_indels>
+
+This flag option causes the script to use averaged quality scores across indels rather than inflated scores which are increased proportional to the length of the indel.  NOTE: This option is currently inactive as "old_indels" has become the default until I investigate the new indel calling more carefully.
+
+=item B<--only_nonref>
+
+This flag option causes the script to only print lines that predict genotypes that are non homozygous reference.
+
+=item B<--align_bias> I<bias_value>
+
+This option specifies an additional expected percentage of aligned bases that are expected to be the reference allele due to bias in the alignment favoring the reference base.  For example, if the alignment bias has value .05, mpg will expect a GT heterozygous position with reference base "G" to have roughly 55% G's aligned at that position, and 45% T's.  It can also be used to tilt the expected percentages due to included probe sequence, which will always be reference, but in the long run it would be better to have a position-dependent alignment bias that only changed these expected values where the probes are located.  (Default: 0)
+
+=item B<--bam_filter> I<'bam filter options'>
+
+Specifies filters to apply to the C<samtools view> command, to limit the SAM
+alignments that are processed by bam2mpg.  Potential filtering options
+include the mapping quality (-qNN), "proper pair" flag (-f2), and duplicate
+flag (-F1024).  The default is to exclude unmapped reads (-F4); if you
+supply your own filter, be sure to include this value in the C<-F> flag,
+e.g. by adding 4+512+1024=1540 to exclude unmapped reads, QC failures, and
+duplicate reads.  It is advisable to always use quotes around the options,
+and is required when there are spaces between options, e.g. C<'-q20 -F 1540'>.
+
+=item B<--ds_coverage> I<min_bases>
+
+This option specifies a minimum number of bases that must be seen on each strand for that base's counts to be included in the probability calculation.  For example, if -ds_coverage is specified as 1, and an aligned "T" is observed multiple times on the forward strand, but never on the reverse strand, no T's will be included in the calculation because T was not seen at least once on the reverse strand.  This option is dangerous in that it can artificially amplify scores by eliminating errors, so its use is discouraged.
+
+=item B<--use_seed> I<seed value>
+
+This option sets the random seed to the specified value at the beginning of the run.  Perl's rand function is used for choosing a subset of reads at a position when the depth of coverage exceeds 200.
+
+=item B<--nocache>
+
+This flag option prevents bam2mpg from caching the SNV genotype calls it sees at each site.  This caching is meant to speed up run-time when genotypes are being called genome-wide, but because the caching doesn't consider exact base qualities, it can lead to slightly inaccurate scoring (but generally not actual genotype errors, especially when --qual_filter is used).
+
+=item B<--sam_filter> I<"unix command">
+
+The specified command is applied as a filter between the C<samtools view> and
+C<samtools pileup> commands.  This means that your command should expect SAM
+format, and should print SAM format lines for alignments that pass your
+filter criteria.  Default is no additional filtering (but see
+C<--bam_filter>).  If your filter can be accomplished with options to
+C<samtools view>, using C<--bam_filter> will be more efficient.
+
+=item B<--pileup_filter> I<"pileup options">
+
+The specified options are appended to the call to "samtools mpileup".  By default, -B is applied, since it looks as if BAQ quality scores hurt sensitivity.  Anything specified with the --pileup_filter option will supersede the -B option (i.e., -B will not be applied if --pileup_filter is used, and -B is not included in the option.
+
+=item B<--snv_vcf> I<"path of SNV VCF file to write">
+
+This option specifies the path of a VCF file to be written containing MPG genotypes in VCF format.  If the filename ends in ".gz" or ".bgz", the program will attempt to pipe the VCF string to "bzip2" before printing.
+
+=item B<--div_vcf> I<"path of DIV VCF file to write">
+
+This option specifies the path of a VCF file to be written containing MPG genotypes in VCF format.  If the filename ends in ".gz" or ".bgz", the program will attempt to pipe the VCF string to "bzip2" before printing.
+
+=item B<--mpg> I<"path of MPG-formatted output file to write">
+
+This option specifies the path of an MPG file to be written containing genotypes in MPG format.  If the filename ends in ".gz", the program will attempt to pipe the VCF string to "gzip" before printing.
+
+=back
+
+=head1 AUTHOR
+
+ Nancy F. Hansen - nhansen@mail.nih.gov
+
+=head1 LEGAL
+
+This software/database is "United States Government Work" under the terms of
+the United States Copyright Act.  It was written as part of the authors'
+official duties for the United States Government and thus cannot be
+copyrighted.  This software/database is freely available to the public for
+use without a copyright notice.  Restrictions cannot be placed on its present
+or future use. 
+
+Although all reasonable efforts have been taken to ensure the accuracy and
+reliability of the software and data, the National Human Genome Research
+Institute (NHGRI) and the U.S. Government does not and cannot warrant the
+performance or results that may be obtained by using this software or data.
+NHGRI and the U.S.  Government disclaims all warranties as to performance,
+merchantability or fitness for any particular purpose. 
+
+In any work or product derived from this material, proper attribution of the
+authors as the source of the software or data should be made, using "NHGRI
+Genome Technology Branch" as the citation. 
+
+=cut
+

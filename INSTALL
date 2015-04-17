@@ -1,0 +1,40 @@
+Bam2mpg package
+
+Predict variants and call genotypes, with MPG scores, from a single sample's BAM file of
+next-generation read alignments.
+
+INSTALLATION:
+
+In addition to the software included in this package, the user must have a working copy of 
+samtools installed and in ones path (version 0.1.16 or greater), available at 
+http://samtools.sourceforge.net.
+
+To install bam2mpg system-wide (root permissions required):
+
+    perl Build.PL
+    ./Build
+    ./Build test
+    ./Build install
+
+For local user installation:
+
+    perl Build.PL --install_base $HOME
+    ./Build
+    ./Build test
+    ./Build install
+
+    Then, to access the installed scripts, $HOME/bin must be in your path:
+
+        export PATH=$HOME/bin:$PATH
+    
+    And $HOME/lib/perl5 must be in your PERL5LIB path:
+
+        export PERL5LIB=$HOME/lib/perl5:$PERL5LIB
+
+    The above export commands can be added to your .profile or .bash_profile
+    in order to make them available each time you log in.
+
+USAGE:
+
+Run perldoc bam2mpg for complete documentation.
+

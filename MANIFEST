@@ -1,0 +1,12 @@
+Build.PL
+MANIFEST			This list of files
+t/1_load.t
+t/2_call.t
+t/testbam1.bam
+t/testref.fa
+t/testref.fa.fai
+README
+DOCUMENTATION
+LEGAL
+INSTALL
+META.yml

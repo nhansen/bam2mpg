@@ -1,0 +1,261 @@
+BAM2MPG(1)            User Contributed Perl Documentation           BAM2MPG(1)
+
+
+
+NNAAMMEE
+       bbaamm22mmppgg - Most probable genotype program for predicting variants and
+       genotypes from alignments of short reads in BAM format.
+
+SSYYNNOOPPSSIISS
+       bbaamm22mmppgg _r_e_f_._f_a_s_t_a _a_l_n_._s_o_r_t_e_d_._b_a_m
+
+DDEESSCCRRIIPPTTIIOONN
+       This script uses samtools to process a BAM formatted file (http://sam-
+       tools.sourceforge.net) and call genotypes and confidence scores across
+       a covered region.
+
+       For a set of aligned allele observations, the MPG ("Most Probable Geno-
+       type") algorithm is used to calculate the posterior probability of
+       every possible diploid genotype (or single-allele genotypes for regions
+       specified with the --single_copy option, e.g., on the non-PAR regions
+       of the X and Y chromosome in a male).  The statistical model uses base
+       quality scores to calculate the probability of base-calling errors, and
+       assumes a single prior probability for any non-homozygous-reference
+       genotype.
+
+MMPPGG IINNPPUUTT
+       The first argument to bam2mpg is the path of a fasta-formatted file for
+       the reference sequence.  This fasta file must have a corresponding sam-
+       tools index file with the same name except for an appended ".fai".
+
+       The second argument to bam2mpg is the path of a BAM-formatted file of
+       aligned sequencing reads.  This file must be sorted and indexed using
+       samtools prior to running bam2mpg.
+
+MMPPGG OOUUTTPPUUTT
+       If no vcf file is specified (either by --snv_vcf or --div_vcf options,
+       see below), and no mpg file is specified (using the --mpg option, see
+       below), the standard output of the program will contain "MPG" lines
+       with nine tab-separated fields.  These fields are:
+
+       vvaarriiaanntt ttyyppee
+            The variant type can be "MPG_SNV", which indicates a single base
+            change at the position specified by the second and third fields,
+            or "MPG_DIV" which indicates a deletion or insertion occurring
+            between the "flanking" positions separated by a colon in the third
+            field.
+
+       cchhrroommoossoommee
+            This is the name of the entry in the fasta reference sequence
+            passed as the first argument (and of the matching reference entry
+            in the BAM file).
+
+       ppoossiittiioonn
+            For an SNV, the position reported is the actual position of the
+            nucleotide change.  For DIV’s, this field contains a colon-sepa-
+            rated pair of positions, which represent the flanking positions
+            surrounding the largest variable region in the sequence.  So, for
+            example, in a variable-length run of T’s, the flanking positions
+            would be the positions of the non-T characters outside of the run,
+            and the alleles reported in the fourth and fifth fields would be
+            the T’s between these flanking positions.
+
+       rreeffeerreennccee aalllleellee
+            This is the base or bases seen in the reference sequence either at
+            the specified position (for an SNV) or between the reported flank-
+            ing positions (for a DIV).  When the flanking positions are
+            adjacent, so there are no bases between them, a "*" is reported to
+            enable splitting on white space rather than tabs.
+
+       ggeennoottyyppee
+            The genotype reported is the genotype with the highest posterior
+            probability according to Bayes theorem, given the observed reads
+            and quality scores, according to the program’s error model.  For
+            SNV’s, the two alleles are concatenated, so, for example "AT"
+            indicates one A and one T.  For DIV’s, the two alleles are sepa-
+            rated by a colon, with a "*" indicating an allele of zero bases.
+
+            When the --single_copy option is used, single allele genotypes are
+            reported, so no colon-separation is used in the DIV.  This lack of
+            a colon in MPG_DIV genotypes, as well as a single-character geno-
+            type at MPG_SNV positions, is what distinguishes "single_copy"
+            output.
+
+       MMPPGG ssccoorree
+            The MPG score field contains the difference between the natural
+            logarithms of the most probable and second most probable geno-
+            type’s probabilities, and is therefore an indicator of the proba-
+            bility the reported genotype is correct.  So, for example, a score
+            of 10 would imply that the reported genotype was approximately
+            22,000 times as probable as the next most probable genotype.
+            Since bam2mpg will call genotypes at any base position, variant or
+            not, we recommend using a score cutoff of 10 to avoid a high level
+            of false positive predictions of variation.
+
+       rreeff//nnoonn--rreeff ffiieelldd
+            This field is 0 for a homozygous-reference genotype, and 1 for
+            anything else, allowing easy extraction of non-reference genotype
+            lines with "awk".
+
+       ccoovveerraaggee
+            This field reports the number of reads used to calculate the most
+            probable genotype.  It does not include bases that have been fil-
+            tered for quality (with --qual_filter) or reads beyond the 200
+            maximum reads the program allows.
+
+       MMPPVV ssccoorree
+            The MPV score reports the difference between the natural loga-
+            rithms of the most probable and the homozygous reference genotype,
+            and is therefore an indicator of the probability that the posi-
+            tion’s true genotype is something other than homozygous reference
+            (although not a phred-scaled indicator).
+
+MMPPGG OOPPTTIIOONNSS
+       ----rreeggiioonn _c_h_r
+       ----rreeggiioonn _c_h_r_:_s_t_a_r_t_-_e_n_d
+            This option specifies a region as a reference entry optionally
+            followed by a position range, and causes variants to be called
+            only in that region.
+
+       ----qquuaall__ffiilltteerr _m_i_n_i_m_u_m___q_u_a_l_i_t_y
+            This option specifies a minimum base quality score necessary for a
+            base to be included in the calculation for a particular aligned
+            position.  Bases with quality scores below this value will be com-
+            pletely ignored.  At GTB, bam2mpg is almost always run with
+            --qual_filter 20. (Default: 0)
+
+       ----ssiinnggllee__ccooppyy _c_h_r_1_:_s_t_a_r_t_1_-_e_n_d_1_,_c_h_r_2_:_s_t_a_r_t_2_-_e_n_d_2
+            This option specifies regions for which only a single copy exists
+            in the genome, so that only one allele is expected to be seen.
+            The regions should be comma-separated without spaces, and in the
+            same format as expected by the --region option.
+
+       ----iinnddeellss
+            This flag option causes the script to skip SNV predictions and
+            only report DIV variants.
+
+       ----nnoo__iinnddeellss
+            This flag option causes the script to skip DIV predictions and
+            only report SNV variants.
+
+       ----oolldd__iinnddeellss
+            This flag option causes the script to use averaged quality scores
+            across indels rather than inflated scores which are increased pro-
+            portional to the length of the indel.  NOTE: This option is cur-
+            rently inactive as "old_indels" has become the default until I
+            investigate the new indel calling more carefully.
+
+       ----oonnllyy__nnoonnrreeff
+            This flag option causes the script to only print lines that pre-
+            dict genotypes that are non homozygous reference.
+
+       ----aalliiggnn__bbiiaass _b_i_a_s___v_a_l_u_e
+            This option specifies an additional expected percentage of aligned
+            bases that are expected to be the reference allele due to bias in
+            the alignment favoring the reference base.  For example, if the
+            alignment bias has value .05, mpg will expect a GT heterozygous
+            position with reference base "G" to have roughly 55% G’s aligned
+            at that position, and 45% T’s.  It can also be used to tilt the
+            expected percentages due to included probe sequence, which will
+            always be reference, but in the long run it would be better to
+            have a position-dependent alignment bias that only changed these
+            expected values where the probes are located.  (Default: 0)
+
+       ----bbaamm__ffiilltteerr _’_b_a_m _f_i_l_t_e_r _o_p_t_i_o_n_s_’
+            Specifies filters to apply to the "samtools view" command, to
+            limit the SAM alignments that are processed by bam2mpg.  Potential
+            filtering options include the mapping quality (-qNN), "proper
+            pair" flag (-f2), and duplicate flag (-F1024).  The default is to
+            exclude unmapped reads (-F4); if you supply your own filter, be
+            sure to include this value in the "-F" flag, e.g. by adding
+            4+512+1024=1540 to exclude unmapped reads, QC failures, and dupli-
+            cate reads.  It is advisable to always use quotes around the
+            options, and is required when there are spaces between options,
+            e.g. '-q20 -F 1540'.
+
+       ----ddss__ccoovveerraaggee _m_i_n___b_a_s_e_s
+            This option specifies a minimum number of bases that must be seen
+            on each strand for that base’s counts to be included in the proba-
+            bility calculation.  For example, if -ds_coverage is specified as
+            1, and an aligned "T" is observed multiple times on the forward
+            strand, but never on the reverse strand, no T’s will be included
+            in the calculation because T was not seen at least once on the
+            reverse strand.  This option is dangerous in that it can artifi-
+            cially amplify scores by eliminating errors, so its use is dis-
+            couraged.
+
+       ----uussee__sseeeedd _s_e_e_d _v_a_l_u_e
+            This option sets the random seed to the specified value at the
+            beginning of the run.  Perl’s rand function is used for choosing a
+            subset of reads at a position when the depth of coverage exceeds
+            200.
+
+       ----nnooccaacchhee
+            This flag option prevents bam2mpg from caching the SNV genotype
+            calls it sees at each site.  This caching is meant to speed up
+            run-time when genotypes are being called genome-wide, but because
+            the caching doesn’t consider exact base qualities, it can lead to
+            slightly inaccurate scoring (but generally not actual genotype
+            errors, especially when --qual_filter is used).
+
+       ----ssaamm__ffiilltteerr _"_u_n_i_x _c_o_m_m_a_n_d_"
+            The specified command is applied as a filter between the "samtools
+            view" and "samtools pileup" commands.  This means that your com-
+            mand should expect SAM format, and should print SAM format lines
+            for alignments that pass your filter criteria.  Default is no
+            additional filtering (but see "--bam_filter").  If your filter can
+            be accomplished with options to "samtools view", using "--bam_fil-
+            ter" will be more efficient.
+
+       ----ppiilleeuupp__ffiilltteerr _"_p_i_l_e_u_p _o_p_t_i_o_n_s_"
+            The specified options are appended to the call to "samtools
+            mpileup".  By default, -B is applied, since it looks as if BAQ
+            quality scores hurt sensitivity.  Anything specified with the
+            --pileup_filter option will supersede the -B option (i.e., -B will
+            not be applied if --pileup_filter is used, and -B is not included
+            in the option.
+
+       ----ssnnvv__vvccff _"_p_a_t_h _o_f _S_N_V _V_C_F _f_i_l_e _t_o _w_r_i_t_e_"
+            This option specifies the path of a VCF file to be written con-
+            taining MPG genotypes in VCF format.  If the filename ends in
+            ".gz" or ".bgz", the program will attempt to pipe the VCF string
+            to "bzip2" before printing.
+
+       ----ddiivv__vvccff _"_p_a_t_h _o_f _D_I_V _V_C_F _f_i_l_e _t_o _w_r_i_t_e_"
+            This option specifies the path of a VCF file to be written con-
+            taining MPG genotypes in VCF format.  If the filename ends in
+            ".gz" or ".bgz", the program will attempt to pipe the VCF string
+            to "bzip2" before printing.
+
+       ----mmppgg _"_p_a_t_h _o_f _M_P_G_-_f_o_r_m_a_t_t_e_d _o_u_t_p_u_t _f_i_l_e _t_o _w_r_i_t_e_"
+            This option specifies the path of an MPG file to be written con-
+            taining genotypes in MPG format.  If the filename ends in ".gz",
+            the program will attempt to pipe the VCF string to "gzip" before
+            printing.
+
+AAUUTTHHOORR
+        Nancy F. Hansen - nhansen@mail.nih.gov
+
+LLEEGGAALL
+       This software/database is "United States Government Work" under the
+       terms of the United States Copyright Act.  It was written as part of
+       the authors’ official duties for the United States Government and thus
+       cannot be copyrighted.  This software/database is freely available to
+       the public for use without a copyright notice.  Restrictions cannot be
+       placed on its present or future use.
+
+       Although all reasonable efforts have been taken to ensure the accuracy
+       and reliability of the software and data, the National Human Genome
+       Research Institute (NHGRI) and the U.S. Government does not and cannot
+       warrant the performance or results that may be obtained by using this
+       software or data.  NHGRI and the U.S.  Government disclaims all war-
+       ranties as to performance, merchantability or fitness for any particu-
+       lar purpose.
+
+       In any work or product derived from this material, proper attribution
+       of the authors as the source of the software or data should be made,
+       using "NHGRI Genome Technology Branch" as the citation.
+
+
+
+perl v5.8.8                       2015-04-16                        BAM2MPG(1)
