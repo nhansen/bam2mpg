@@ -1,0 +1,35 @@
+Bam2mpg
+
+The program "bam2mpg" calls genotypes from sequence reads of haploid or diploid DNA 
+aligned to a closely-related reference sequence. The program reads alignments in BAM 
+format (http://samtools.sourceforge.net). The MPG (Most Probable Genotype) algorithm 
+is based on a Bayesian model which simulates sampling from one or two alleles with 
+sequencing error, and then calculates the likelihood of each possible genotype given 
+the observed sequence data. Using prior probabilities dependent on the expected 
+heterozygosity of the sequence, MPG then predicts the "Most Probable Genotype" at each 
+site, along with quality scores estimating the accuracy of the calls.
+
+Bam2mpg was written by Nancy Fisher Hansen, a staff scientist in the Genome Technology 
+Branch (GTB) of NHGRI, an institute at the National Institutes of Health.  Nancy can 
+be reached at nhansen@mail.nih.gov.
+
+Build Dependencies
+
+* git
+* samtools 0.1.16 or above
+
+Build Instructions
+
+Clone the bam2mpg repository:
+
+git clone git://github.com/nhansen/bam2mpg.git
+
+Build bam2mpg:
+
+cd bam2mpg
+perl Build.PL
+./Build
+./Build test
+./Build install
+
+* For local installation, call perl Build.PL with "--install_base $HOME"
