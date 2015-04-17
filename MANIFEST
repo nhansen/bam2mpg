@@ -2,7 +2,7 @@ Build.PL
 MANIFEST			This list of files
 t/1_load.t
 t/2_call.t
-t/testbam1.bam
+t/testbam.bam
 t/testref.fa
 t/testref.fa.fai
 README
@@ -10,3 +10,12 @@ DOCUMENTATION
 LEGAL
 INSTALL
 META.yml
+scripts/bam2mpg
+scripts/mpg2bed.pl
+scripts/mpg2vcf.pl
+lib/GTB/FASTA.pm
+lib/GTB/File.pm
+lib/GTB/Unix.pm
+lib/GTB/Var/Polymorphism.pm
+lib/GTB/Var/SiteProfile.pm
+lib/GTB/Var/VCF.pm

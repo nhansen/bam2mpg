@@ -1,0 +1,32 @@
+---
+abstract: 'Script for calling variants and genotypes from single-sample BAM files'
+author:
+  - 'GTB Perl Programmers'
+configure_requires:
+  Module::Build: 0.36
+generated_by: 'Module::Build version 0.3601'
+license: perl
+meta-spec:
+  url: http://module-build.sourceforge.net/META-spec-v1.4.html
+  version: 1.4
+name: bam2mpg
+provides:
+  GTB::FASTA:
+    file: lib/GTB/FASTA.pm
+    version: 0.05
+  GTB::File:
+    file: lib/GTB/File.pm
+    version: 0.23
+  GTB::Unix:
+    file: lib/GTB/Unix.pm
+  GTB::Var::Polymorphism:
+    file: lib/GTB/Var/Polymorphism.pm
+    version: 0.01
+  GTB::Var::SiteProfile:
+    file: lib/GTB/Var/SiteProfile.pm
+    version: 0.01
+  GTB::Var::VCF:
+    file: lib/GTB/Var/VCF.pm
+resources:
+  license: http://dev.perl.org/licenses/
+version: 1

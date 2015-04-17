@@ -4,3 +4,4 @@ t/testout/
 t/calltest[1-9]*.out
 blib/
 Build
+t/create_ref/

@@ -52,7 +52,7 @@ use warnings;
 use FileHandle;
 use Carp;
 
-our $VERSION  = '$Rev: 7271 $';
+#our $VERSION  = '$Rev: 7271 $';
 our $REVISION = '$Id: VCF.pm 7271 2014-08-31 13:42:48Z nhansen $';
 
 ###########################################################

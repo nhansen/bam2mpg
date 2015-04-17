@@ -5,7 +5,7 @@ use strict;
 use Test::More;
 use Module::Build;
 
-my @scripts = qw( bam2mpg mpg2bed.pl mpg2vcf.pl );
+my @scripts = qw( scripts/bam2mpg scripts/mpg2bed.pl scripts/mpg2vcf.pl );
 
 # Direct useless output to STDERR, to avoid confusing Test::Harness
 my $stdin = select STDERR;
