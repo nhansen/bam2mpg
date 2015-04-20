@@ -229,6 +229,9 @@ sub vcf_line {
     my $info_flag = ($ref_allele eq $uc_ref) ? '.' : 'RM';
     $ref_allele = $uc_ref;
 
+    my $doc = @bases;
+    my $filter = ($doc && $variant_score>=10 && $variant_score/$doc>=0.5) ? 'PASS' : '.';
+
     my @alleles = ($type eq 'SNV') ? split //, $genotype : split /:/, $genotype;
 
     my ($lfe, $rfs);
@@ -303,7 +306,7 @@ sub vcf_line {
     my $format_string = (defined($ad_string)) ? 'GT:GQ:DP:AD' : 'GT:GQ:DP';
     $filtered_depth .= ":$ad_string" if (defined($ad_string));
 
-    my $vcf_line = "$chrom\t$pos\t.\t$ref_allele\t$alt_alleles\t$variant_score\t.\t$info_flag\t$format_string\t$index_genotype:$genotype_score:$filtered_depth\n";
+    my $vcf_line = "$chrom\t$pos\t.\t$ref_allele\t$alt_alleles\t$variant_score\t$filter\t$info_flag\t$format_string\t$index_genotype:$genotype_score:$filtered_depth\n";
 
     if (my $fh = $self->{file_handle}) {
         print $fh $vcf_line

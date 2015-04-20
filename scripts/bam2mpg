@@ -127,10 +127,10 @@ open PILEUP, $pileup_pipe
     or croak "Couldn\'t run $samtools_exe on $bam_file\n";
 
 my $rh_read_pointers = {}; # will contain pointers to align coords of current reads
-my $rh_align_coords = {}; # will contain alignment coordinates for each read (used in indel calling)
+my $ra_align_coords = []; # will contain alignment coordinates for each read (used in indel calling)
 my $rh_indel_coverage = {}; # will hold coverage objects for indels
 
-my $last_ref;
+my ($last_ref, $ref_name);
 my $ref_seq;
 if (defined($seed)) {
     srand($seed);
@@ -144,8 +144,16 @@ while (<PILEUP>)
 {
     if (/^(\S+)\s(\d+)\s([ATGCatgcNn])\s(\d+)\s(\S+)\s(\S+)/)
     {
-        my ($ref_name, $ref_pos, $ref_base, $no_bases, $cov_string, $qual_string) = ($1, $2, $3, $4, $5, $6);
+        my ($this_ref, $ref_pos, $ref_base, $no_bases, $cov_string, $qual_string) = ($1, $2, $3, $4, $5, $6);
+        $ref_name = $this_ref;
         if (!$last_ref || $last_ref ne $ref_name) {
+            if (($last_ref) && (!$no_indels))
+            {
+                process_indels($last_ref, $rh_indel_coverage, $ra_align_coords, \$ref_seq, $rh_indel_error_count);
+                $ra_align_coords = [];
+                $rh_indel_coverage = {};
+                print_error_tables($last_ref, $rh_subs_error_count, $rh_indel_error_count, $rh_total_count) if ($errors);
+            }
             $last_ref = $ref_name;
             $ref_seq = $fasta_db->seq($ref_name);
         }
@@ -159,11 +167,11 @@ while (<PILEUP>)
         my $uc_ref_base = uc $ref_base;
 
         my $ra_coverage = []; # will contain bases and qualities seen
-        $rh_indel_coverage->{$ref_name} = {} if (!defined ($rh_indel_coverage->{$ref_name}));
-        $rh_align_coords->{$ref_name} = [] if (!defined ($rh_align_coords->{$ref_name}));
+        $rh_indel_coverage = {} if (!defined ($rh_indel_coverage));
+        $ra_align_coords = [] if (!defined ($ra_align_coords));
         $rh_read_pointers->{$ref_name} = [] if (!defined ($rh_read_pointers->{$ref_name}));
 
-        split_coverage($ra_coverage, $rh_read_pointers->{$ref_name}, $rh_align_coords->{$ref_name}, $rh_indel_coverage->{$ref_name}, $cov_string, $qual_string, $ref_pos, \$ref_seq, $qual_offset);
+        split_coverage($ra_coverage, $rh_read_pointers->{$ref_name}, $ra_align_coords, $rh_indel_coverage, $cov_string, $qual_string, $ref_pos, \$ref_seq, $qual_offset);
 
         next if ($indels_only);
 
@@ -193,6 +201,9 @@ while (<PILEUP>)
         }
         my $cs_string = join("", (sort @{$ra_cs}));
         if (!$sc_here and !$nocache and exists($mpgHash{$ref_base}{$cs_string}) and !$opt_pooling) {
+            my $cache_string = $mpgHash{$ref_base}{$cs_string};
+            # cached genotype might be hom ref, if so skip if --only_nonref option is specified:
+            next if (($cache_string =~ /\t0\t(\S+)\t(\S+)$/) && ($only_nonref));
             if (!$mpg_fh && !$snv_vcf_obj) { # no output files for SNV's specified--write to STDOUT:
 
                 print "MPG_SNV\t$ref_name\t$ref_pos\t$ref_base";
@@ -267,8 +278,8 @@ while (<PILEUP>)
     
             my $nr = (($sc_here && $mpg eq $uc_ref_base) || 
                              ($mpg eq "$uc_ref_base$uc_ref_base")) ? 0 : 1;
-            next if ($nr == 0 and $only_nonref);
             $mpgHash{$ref_base}{$cs_string} = "\t$mpg\t$mpg_score\t$nr\t$coverage\t$mpv_score" unless ($sc_here || $nocache);
+            next if ($nr == 0 and $only_nonref);
             if (!$mpg_fh && !$snv_vcf_obj) { # no output files for SNV's specified--write to STDOUT:
 
                 print "MPG_SNV\t$ref_name\t$ref_pos\t$ref_base\t$mpg\t$mpg_score\t$nr\t$coverage\t$mpv_score";
@@ -310,16 +321,11 @@ while (<PILEUP>)
 
 close PILEUP;
 
-exit if ($opt_pooling);
-
-unless ($no_indels)
+unless ($no_indels) # process indels for last reference entry
 {
-    foreach my $ref (keys %{$rh_align_coords})
-    {
-        my $ref_seq = $fasta_db->seq($ref);
-        process_indels($ref, $rh_indel_coverage->{$ref}, $rh_align_coords->{$ref}, \$ref_seq, $rh_indel_error_count);
-        print_error_tables($ref, $rh_subs_error_count, $rh_indel_error_count, $rh_total_count) if ($errors);
-    }
+    my $ref_seq = $fasta_db->seq($ref_name);
+    process_indels($ref_name, $rh_indel_coverage, $ra_align_coords, \$ref_seq, $rh_indel_error_count);
+    print_error_tables($ref_name, $rh_subs_error_count, $rh_indel_error_count, $rh_total_count) if ($errors);
 }
 
 sub open_output_files {
