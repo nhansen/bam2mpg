@@ -11,7 +11,9 @@ site, along with quality scores estimating the accuracy of the calls.
 
 Bam2mpg was written by Nancy Fisher Hansen, a staff scientist in the Genome Technology 
 Branch (GTB) of NHGRI, an institute at the National Institutes of Health.  Nancy can 
-be reached at nhansen@mail.nih.gov.
+be reached at nhansen@mail.nih.gov. If you use bam2mpg in your work, please cite the 
+paper: Teer, J.K. et al. 2010. Systematic comparison of three genomic enrichment methods 
+for massively parallel DNA sequencing. Genome Research. 20(10):1420-31.
 
 Build Dependencies
 
