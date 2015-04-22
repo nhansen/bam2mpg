@@ -3,6 +3,7 @@ MANIFEST			This list of files
 t/1_load.t
 t/2_call.t
 t/testbam.bam
+t/testbam.bam.bai
 t/testref.fa
 t/testref.fa.fai
 README
