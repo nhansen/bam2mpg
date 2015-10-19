@@ -642,7 +642,7 @@ sub filter_for_ds_coverage
 
     my @new_coverage = ();
 
-    foreach my $for_base qw(A T G C)
+    foreach my $for_base (qw(A T G C))
     {
         my $rev_base = lc $for_base;
         my @for_bases = grep {$_->{'base'} eq $for_base} @{$ra_coverage};

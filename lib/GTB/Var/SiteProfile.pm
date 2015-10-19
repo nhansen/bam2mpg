@@ -449,7 +449,7 @@ sub filter_coverage {
         my $no_old_bases = @{$ra_coverage};
         my @new_coverage = ();
 
-        foreach my $for_base qw(A T G C)
+        foreach my $for_base (qw(A T G C))
         {
             my $rev_base = lc $for_base;
             my $no_for = grep {$_->{'base'} eq $for_base} @{$ra_coverage};
