@@ -29,4 +29,4 @@ provides:
     file: lib/GTB/Var/VCF.pm
 resources:
   license: http://dev.perl.org/licenses/
-version: 1
+version: v1.0.1
